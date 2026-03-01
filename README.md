@@ -19,6 +19,12 @@ A CLI to compress Cargo target artifacts with [APFS compression] on macOS using
 cargo install cargo-apfs-compress
 ```
 
+Or install directly from this repository:
+
+```bash
+cargo install --git https://github.com/bgw/cargo-apfs-compress cargo-apfs-compress
+```
+
 ## Use
 
 From a Cargo project directory, run:
