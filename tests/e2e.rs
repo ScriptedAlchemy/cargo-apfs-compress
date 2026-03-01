@@ -71,3 +71,49 @@ fn command_returns_non_zero_on_failure() {
 
     assert!(!output.status.success());
 }
+
+#[test]
+fn command_dry_run_prints_preview() {
+    let temp = tempdir().unwrap();
+    write_workspace(temp.path());
+
+    let debug_dir = temp.path().join("target").join("debug");
+    fs::create_dir_all(&debug_dir).unwrap();
+    fs::write(debug_dir.join("artifact.bin"), b"artifact").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-apfs-compress"))
+        .arg("--dry-run")
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Dry-run mode"));
+    assert!(stdout.contains("Would compress"));
+}
+
+#[test]
+fn command_node_modules_dry_run_works_without_cargo_workspace() {
+    let temp = tempdir().unwrap();
+    fs::create_dir_all(temp.path().join("node_modules").join("pkg")).unwrap();
+    fs::write(
+        temp.path()
+            .join("node_modules")
+            .join("pkg")
+            .join("index.js"),
+        "module.exports = 1;\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-apfs-compress"))
+        .args(["--cache", "node-modules", "--dry-run"])
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Would compress"));
+    assert!(stdout.contains("node_modules"));
+}

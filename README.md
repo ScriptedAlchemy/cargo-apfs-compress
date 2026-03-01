@@ -32,6 +32,35 @@ By default, `cargo apfs-compress` will find all profiles within `target`, lock
 them, and recursively compress the contents of every file within using the
 [LZFSE] algorithm. Files that are already compressed are skipped.
 
+You can also target other high-value dependency/build caches:
+
+```bash
+# Preview node_modules without modifying files
+cargo apfs-compress --cache node-modules --dry-run
+
+# Compress Go caches (GOCACHE + GOMODCACHE)
+cargo apfs-compress --cache go
+
+# Mix cache sources and custom directories
+cargo apfs-compress \
+  --cache cargo \
+  --cache node-modules \
+  --cache-dir ~/.pnpm-store \
+  --cache-dir ~/.npm
+```
+
+### Preview mode
+
+Use `--dry-run` (or `--preview`) to inspect what would be processed before
+compression:
+
+```bash
+cargo apfs-compress --dry-run
+```
+
+Dry-run mode discovers and reports directories, file counts, and total logical
+bytes, but does not compress files.
+
 > [!NOTE]
 > Newly created or updated files are not automatically compressed by APFS, so
 > you may need to re-run compression periodically after new builds.

@@ -3,8 +3,9 @@ use applesauce::FileCompressor;
 use applesauce::compressor::Kind;
 use applesauce::progress::Progress as _;
 use clap::{ArgAction, Parser, ValueEnum};
+use indicatif::HumanBytes;
 use serde::Deserialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,13 @@ impl CompressionArg {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, ValueEnum)]
+pub enum CacheArg {
+    Cargo,
+    NodeModules,
+    Go,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "cargo-apfs-compress")]
 pub struct Cli {
@@ -59,6 +67,18 @@ pub struct Cli {
 
     #[arg(short = 'q', long = "quiet", action = ArgAction::Count, conflicts_with = "verbose")]
     pub quiet: u8,
+
+    /// Cache sources to include. Defaults to cargo if omitted.
+    #[arg(long = "cache", value_enum)]
+    pub caches: Vec<CacheArg>,
+
+    /// Additional cache directories to compress.
+    #[arg(long = "cache-dir")]
+    pub cache_dirs: Vec<PathBuf>,
+
+    /// Show what would be compressed without writing changes.
+    #[arg(long = "dry-run", alias = "preview")]
+    pub dry_run: bool,
 }
 
 impl Cli {
@@ -71,6 +91,39 @@ impl Cli {
             Verbosity::Normal
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LockPolicy {
+    CargoLock,
+    None,
+}
+
+#[derive(Clone, Debug)]
+struct WorkDirSpec {
+    path: PathBuf,
+    lock_policy: LockPolicy,
+    sources: BTreeSet<String>,
+}
+
+impl WorkDirSpec {
+    fn source_summary(&self) -> String {
+        self.sources.iter().cloned().collect::<Vec<_>>().join(",")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DirSummary {
+    files: u64,
+    bytes: u64,
+}
+
+#[derive(Deserialize)]
+struct GoEnvOutput {
+    #[serde(rename = "GOCACHE")]
+    gocache: Option<PathBuf>,
+    #[serde(rename = "GOMODCACHE")]
+    gomodcache: Option<PathBuf>,
 }
 
 pub fn resolve_cargo_exe() -> String {
@@ -175,6 +228,143 @@ pub fn resolve_work_dirs(
     }
 
     out.into_iter().collect()
+}
+
+fn selected_cache_sources(caches: &[CacheArg]) -> BTreeSet<CacheArg> {
+    if caches.is_empty() {
+        [CacheArg::Cargo].into_iter().collect()
+    } else {
+        caches.iter().copied().collect()
+    }
+}
+
+fn validate_cli(cli: &Cli, selected_caches: &BTreeSet<CacheArg>) -> Result<()> {
+    if !selected_caches.contains(&CacheArg::Cargo)
+        && (!cli.profiles.is_empty() || !cli.targets.is_empty())
+    {
+        return Err(anyhow!(
+            "--profile/--target are cargo-specific and require --cache cargo"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_go_env_output(stdout: &[u8]) -> Result<Vec<PathBuf>> {
+    let parsed: GoEnvOutput =
+        serde_json::from_slice(stdout).context("failed to parse `go env` JSON output")?;
+
+    let mut dirs = BTreeSet::new();
+    if let Some(path) = parsed.gocache {
+        if !path.as_os_str().is_empty() {
+            dirs.insert(path);
+        }
+    }
+    if let Some(path) = parsed.gomodcache {
+        if !path.as_os_str().is_empty() {
+            dirs.insert(path);
+        }
+    }
+
+    Ok(dirs.into_iter().collect())
+}
+
+fn resolve_go_cache_dirs(cwd: &Path) -> Result<Vec<PathBuf>> {
+    let output = Command::new("go")
+        .args(["env", "-json", "GOCACHE", "GOMODCACHE"])
+        .current_dir(cwd)
+        .output()
+        .context("failed to execute `go env` for cache discovery")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "`go env` failed with status {}: {stderr}",
+            output.status
+        ));
+    }
+    parse_go_env_output(&output.stdout)
+}
+
+fn resolve_custom_cache_dirs(cwd: &Path, cache_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    cache_dirs
+        .iter()
+        .map(|dir| {
+            if dir.is_absolute() {
+                dir.clone()
+            } else {
+                cwd.join(dir)
+            }
+        })
+        .collect()
+}
+
+fn add_work_dir_spec(
+    specs: &mut BTreeMap<PathBuf, WorkDirSpec>,
+    path: PathBuf,
+    lock_policy: LockPolicy,
+    source: &str,
+) {
+    match specs.get_mut(&path) {
+        Some(existing) => {
+            if lock_policy == LockPolicy::CargoLock {
+                existing.lock_policy = LockPolicy::CargoLock;
+            }
+            existing.sources.insert(source.to_owned());
+        }
+        None => {
+            let mut sources = BTreeSet::new();
+            sources.insert(source.to_owned());
+            specs.insert(
+                path.clone(),
+                WorkDirSpec {
+                    path,
+                    lock_policy,
+                    sources,
+                },
+            );
+        }
+    }
+}
+
+fn resolve_work_dir_specs(cli: &Cli, cwd: &Path) -> Result<Vec<WorkDirSpec>> {
+    let selected_caches = selected_cache_sources(&cli.caches);
+    validate_cli(cli, &selected_caches)?;
+
+    let mut specs = BTreeMap::new();
+
+    if selected_caches.contains(&CacheArg::Cargo) {
+        let cargo_exe = resolve_cargo_exe();
+        let target_dir = run_cargo_metadata(&cargo_exe, cwd)?;
+        let dirs = if cli.profiles.is_empty() {
+            discover_default_work_dirs(&target_dir, &cli.targets)?
+        } else {
+            let overrides = load_profile_dir_name_overrides(cwd)?;
+            resolve_work_dirs(&target_dir, &cli.profiles, &cli.targets, &overrides)
+        };
+        for dir in dirs {
+            add_work_dir_spec(&mut specs, dir, LockPolicy::CargoLock, "cargo");
+        }
+    }
+
+    if selected_caches.contains(&CacheArg::NodeModules) {
+        add_work_dir_spec(
+            &mut specs,
+            cwd.join("node_modules"),
+            LockPolicy::None,
+            "node-modules",
+        );
+    }
+
+    if selected_caches.contains(&CacheArg::Go) {
+        for dir in resolve_go_cache_dirs(cwd)? {
+            add_work_dir_spec(&mut specs, dir, LockPolicy::None, "go");
+        }
+    }
+
+    for dir in resolve_custom_cache_dirs(cwd, &cli.cache_dirs) {
+        add_work_dir_spec(&mut specs, dir, LockPolicy::None, "custom");
+    }
+
+    Ok(specs.into_values().collect())
 }
 
 fn is_hidden(name: &str) -> bool {
@@ -283,39 +473,125 @@ impl Compressor for ApplesauceCompressor {
     }
 }
 
+fn collect_input_paths(
+    dir: &Path,
+    exclude_name: Option<&OsStr>,
+    progress: &ProgressBars,
+) -> Result<Vec<PathBuf>> {
+    let mut inputs = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("failed reading {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("failed reading entry in {}", dir.display()))?;
+        if exclude_name.is_some_and(|excluded| entry.file_name() == excluded) {
+            let excluded = exclude_name
+                .and_then(OsStr::to_str)
+                .unwrap_or("<unknown exclusion>");
+            progress.println_verbose(|| format!("exclude {excluded} from {}", dir.display()));
+            continue;
+        }
+        inputs.push(entry.path());
+    }
+    Ok(inputs)
+}
+
+fn with_work_dir_inputs<T>(
+    spec: &WorkDirSpec,
+    progress: &ProgressBars,
+    mut op: impl FnMut(&[PathBuf]) -> Result<T>,
+) -> Result<Option<T>> {
+    if !spec.path.exists() {
+        progress.println_normal(|| format!("skip {} (missing)", spec.path.display()));
+        return Ok(None);
+    }
+    if !spec.path.is_dir() {
+        return Err(anyhow!("{} is not a directory", spec.path.display()));
+    }
+
+    let out = match spec.lock_policy {
+        LockPolicy::CargoLock => {
+            let fs = Filesystem::new(spec.path.clone());
+            let _lock = fs
+                .open_rw_exclusive_create(CARGO_LOCK_NAME, "build directory", progress)
+                .with_context(|| format!("failed to lock {}", spec.path.display()))?;
+            let inputs =
+                collect_input_paths(&spec.path, Some(OsStr::new(CARGO_LOCK_NAME)), progress)?;
+            op(&inputs)?
+        }
+        LockPolicy::None => {
+            let inputs = collect_input_paths(&spec.path, None, progress)?;
+            op(&inputs)?
+        }
+    };
+
+    Ok(Some(out))
+}
+
+fn summarize_paths(paths: &[PathBuf]) -> Result<DirSummary> {
+    let mut summary = DirSummary::default();
+    let mut stack = paths.to_vec();
+    while let Some(path) = stack.pop() {
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+        if metadata.is_file() {
+            summary.files += 1;
+            summary.bytes += metadata.len();
+            continue;
+        }
+        if metadata.is_dir() {
+            for entry in
+                fs::read_dir(&path).with_context(|| format!("failed reading {}", path.display()))?
+            {
+                let entry =
+                    entry.with_context(|| format!("failed reading entry in {}", path.display()))?;
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(summary)
+}
+
+fn preview_work_dir(spec: &WorkDirSpec, progress: &ProgressBars) -> Result<()> {
+    let summary = with_work_dir_inputs(spec, progress, summarize_paths)?;
+    if let Some(summary) = summary {
+        progress.println_normal(|| {
+            format!(
+                "Would compress {} [{}]: {} files, {}",
+                spec.path.display(),
+                spec.source_summary(),
+                summary.files,
+                HumanBytes(summary.bytes)
+            )
+        });
+    }
+    Ok(())
+}
+
+fn process_work_dir_spec(
+    spec: &WorkDirSpec,
+    compression: Kind,
+    progress: &ProgressBars,
+    compressor: &dyn Compressor,
+) -> Result<()> {
+    with_work_dir_inputs(spec, progress, |inputs| {
+        compressor.compress_paths(inputs, compression, progress)
+    })
+    .with_context(|| format!("compression failed for {}", spec.path.display()))?;
+    Ok(())
+}
+
 pub fn process_work_dir(
     dir: &Path,
     compression: Kind,
     progress: &ProgressBars,
     compressor: &dyn Compressor,
 ) -> Result<()> {
-    if !dir.exists() {
-        progress.println_normal(|| format!("skip {} (missing)", dir.display()));
-        return Ok(());
-    }
-    if !dir.is_dir() {
-        return Err(anyhow!("{} is not a directory", dir.display()));
-    }
-
-    let fs = Filesystem::new(dir.to_path_buf());
-    let _lock = fs
-        .open_rw_exclusive_create(CARGO_LOCK_NAME, "build directory", progress)
-        .with_context(|| format!("failed to lock {}", dir.display()))?;
-
-    let mut inputs = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("failed reading {}", dir.display()))? {
-        let entry = entry.with_context(|| format!("failed reading entry in {}", dir.display()))?;
-        if entry.file_name() == OsStr::new(CARGO_LOCK_NAME) {
-            progress
-                .println_verbose(|| format!("exclude {} from {}", CARGO_LOCK_NAME, dir.display()));
-            continue;
-        }
-        inputs.push(entry.path());
-    }
-
-    compressor
-        .compress_paths(&inputs, compression, progress)
-        .with_context(|| format!("compression failed for {}", dir.display()))
+    let mut sources = BTreeSet::new();
+    sources.insert("cargo".to_owned());
+    let spec = WorkDirSpec {
+        path: dir.to_path_buf(),
+        lock_policy: LockPolicy::CargoLock,
+        sources,
+    };
+    process_work_dir_spec(&spec, compression, progress, compressor)
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -326,39 +602,60 @@ pub fn run_with_compressor(cli: Cli, compressor: &dyn Compressor) -> Result<()> 
     let verbosity = cli.verbosity();
     let progress = ProgressBars::new(verbosity);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
-    let cargo_exe = resolve_cargo_exe();
-    let target_dir = run_cargo_metadata(&cargo_exe, &cwd)?;
-    let dirs = if cli.profiles.is_empty() {
-        discover_default_work_dirs(&target_dir, &cli.targets)?
-    } else {
-        let overrides = load_profile_dir_name_overrides(&cwd)?;
-        resolve_work_dirs(&target_dir, &cli.profiles, &cli.targets, &overrides)
-    };
+    let specs = resolve_work_dir_specs(&cli, &cwd)?;
 
     let mut had_error = false;
 
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        let progress_ref = &progress;
-        for dir in dirs {
-            handles.push(scope.spawn(move || {
-                let result =
-                    process_work_dir(&dir, cli.compression.to_kind(), progress_ref, compressor);
-                (dir, result)
-            }));
-        }
+    if cli.dry_run {
+        progress.println_normal(|| "Dry-run mode: previewing directories only".to_owned());
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let progress_ref = &progress;
+            for spec in specs {
+                handles.push(scope.spawn(move || {
+                    let path = spec.path.clone();
+                    let result = preview_work_dir(&spec, progress_ref);
+                    (path, result)
+                }));
+            }
 
-        for handle in handles {
-            let (dir, result) = handle.join().expect("worker thread panicked");
-            match result {
-                Ok(()) => progress.println_normal(|| format!("Compressed {}", dir.display())),
-                Err(error) => {
+            for handle in handles {
+                let (path, result) = handle.join().expect("worker thread panicked");
+                if let Err(error) = result {
                     had_error = true;
-                    progress.error(&dir, &format!("{error:#}"));
+                    progress.error(&path, &format!("{error:#}"));
                 }
             }
-        }
-    });
+        });
+    } else {
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let progress_ref = &progress;
+            for spec in specs {
+                handles.push(scope.spawn(move || {
+                    let path = spec.path.clone();
+                    let result = process_work_dir_spec(
+                        &spec,
+                        cli.compression.to_kind(),
+                        progress_ref,
+                        compressor,
+                    );
+                    (path, result)
+                }));
+            }
+
+            for handle in handles {
+                let (path, result) = handle.join().expect("worker thread panicked");
+                match result {
+                    Ok(()) => progress.println_normal(|| format!("Compressed {}", path.display())),
+                    Err(error) => {
+                        had_error = true;
+                        progress.error(&path, &format!("{error:#}"));
+                    }
+                }
+            }
+        });
+    }
     progress.finish();
 
     if had_error {
@@ -457,6 +754,9 @@ mod tests {
         let cli = Cli::try_parse_from(["cargo-apfs-compress"]).unwrap();
         assert_eq!(cli.compression, CompressionArg::Lzfse);
         assert!(cli.profiles.is_empty());
+        assert!(cli.caches.is_empty());
+        assert!(cli.cache_dirs.is_empty());
+        assert!(!cli.dry_run);
         assert_eq!(cli.verbose, 0);
         assert_eq!(cli.quiet, 0);
     }
@@ -475,6 +775,85 @@ mod tests {
         assert_eq!(cli.quiet, 1);
         assert_eq!(cli.verbose, 0);
         assert_eq!(cli.verbosity(), Verbosity::Quiet);
+    }
+
+    #[test]
+    fn parses_cache_flags_and_dry_run() {
+        let cli = Cli::try_parse_from([
+            "cargo-apfs-compress",
+            "--cache",
+            "node-modules",
+            "--cache",
+            "go",
+            "--cache-dir",
+            "node_modules",
+            "--dry-run",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.caches, vec![CacheArg::NodeModules, CacheArg::Go]);
+        assert_eq!(cli.cache_dirs, vec![PathBuf::from("node_modules")]);
+        assert!(cli.dry_run);
+    }
+
+    #[test]
+    fn defaults_cache_selection_to_cargo() {
+        let selected = selected_cache_sources(&[]);
+        assert_eq!(selected, [CacheArg::Cargo].into_iter().collect());
+    }
+
+    #[test]
+    fn rejects_profile_or_target_without_cargo_cache() {
+        let cli = Cli {
+            profiles: vec!["dev".to_owned()],
+            targets: vec![],
+            compression: CompressionArg::Lzfse,
+            verbose: 0,
+            quiet: 0,
+            caches: vec![CacheArg::NodeModules],
+            cache_dirs: vec![],
+            dry_run: false,
+        };
+        let selected = selected_cache_sources(&cli.caches);
+        let error = validate_cli(&cli, &selected).unwrap_err().to_string();
+        assert!(error.contains("--profile/--target"));
+    }
+
+    #[test]
+    fn parses_go_env_json_output() {
+        let output = br#"{"GOCACHE":"/tmp/go-build","GOMODCACHE":"/tmp/go/pkg/mod"}"#;
+        let dirs = parse_go_env_output(output).unwrap();
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/tmp/go-build"),
+                PathBuf::from("/tmp/go/pkg/mod")
+            ]
+        );
+    }
+
+    #[test]
+    fn resolves_non_cargo_specs_without_metadata() {
+        let root = tempdir().unwrap();
+        let cli = Cli {
+            profiles: vec![],
+            targets: vec![],
+            compression: CompressionArg::Lzfse,
+            verbose: 0,
+            quiet: 0,
+            caches: vec![CacheArg::NodeModules],
+            cache_dirs: vec![
+                PathBuf::from("node_modules"),
+                PathBuf::from("/tmp/custom-cache"),
+            ],
+            dry_run: true,
+        };
+
+        let specs = resolve_work_dir_specs(&cli, root.path()).unwrap();
+        let paths: Vec<PathBuf> = specs.iter().map(|spec| spec.path.clone()).collect();
+        assert!(paths.contains(&root.path().join("node_modules")));
+        assert!(paths.contains(&PathBuf::from("/tmp/custom-cache")));
+        assert_eq!(paths.len(), 2);
     }
 
     #[test]
@@ -640,7 +1019,6 @@ mod tests {
 
     #[test]
     fn returns_error_if_any_worker_fails() {
-        std::thread::sleep(std::time::Duration::from_millis(10_000));
         let root = tempdir().unwrap();
         let target = root.path().join("target").join("debug");
         fs::create_dir_all(&target).unwrap();
@@ -655,6 +1033,9 @@ mod tests {
             compression: CompressionArg::Lzfse,
             verbose: 0,
             quiet: 0,
+            caches: vec![],
+            cache_dirs: vec![],
+            dry_run: false,
         };
 
         let compressor = RecordingCompressor {
@@ -665,5 +1046,34 @@ mod tests {
         let result = run_with_compressor(cli, &compressor);
         std::env::set_current_dir(old).unwrap();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn dry_run_does_not_invoke_compressor() {
+        let root = tempdir().unwrap();
+        let node_modules = root.path().join("node_modules");
+        fs::create_dir_all(&node_modules).unwrap();
+        fs::write(node_modules.join("pkg.json"), br#"{"name":"pkg"}"#).unwrap();
+
+        let old = std::env::current_dir().unwrap();
+        std::env::set_current_dir(root.path()).unwrap();
+
+        let cli = Cli {
+            profiles: vec![],
+            targets: vec![],
+            compression: CompressionArg::Lzfse,
+            verbose: 0,
+            quiet: 0,
+            caches: vec![CacheArg::NodeModules],
+            cache_dirs: vec![],
+            dry_run: true,
+        };
+
+        let compressor = RecordingCompressor::default();
+        let result = run_with_compressor(cli, &compressor);
+
+        std::env::set_current_dir(old).unwrap();
+        assert!(result.is_ok());
+        assert!(compressor.calls.lock().unwrap().is_empty());
     }
 }
