@@ -73,6 +73,25 @@ bytes, but does not compress files.
 
 [LZFSE]: https://en.wikipedia.org/wiki/LZFSE
 
+## How the script works
+
+At a high level, `cargo apfs-compress` does this:
+
+1. Resolves which directories to process.
+   - By default, this is Cargo build output under `target/`.
+   - `--cache` and `--cache-dir` can add other caches (`node_modules`, Go
+     caches, custom directories).
+2. De-duplicates and sorts all resolved directories.
+3. Processes directories in parallel.
+4. For Cargo build directories, acquires the Cargo lock (`.cargo-lock`) before
+   compression and excludes that lock file from compression inputs.
+5. Recursively compresses discovered files with the selected compression kind.
+6. Reports per-directory success/failure and returns non-zero if any directory
+   fails.
+
+If `--dry-run` / `--preview` is enabled, it performs discovery and reporting
+only (no file compression writes).
+
 ## What? Why?
 
 APFS compression stores file data in a compressed form while keeping normal file
