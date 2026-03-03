@@ -19,6 +19,12 @@ A CLI to compress Cargo target artifacts with [APFS compression] on macOS using
 cargo install cargo-apfs-compress
 ```
 
+Or install directly from this repository:
+
+```bash
+cargo install --git https://github.com/bgw/cargo-apfs-compress cargo-apfs-compress
+```
+
 ## Use
 
 From a Cargo project directory, run:
@@ -32,11 +38,59 @@ By default, `cargo apfs-compress` will find all profiles within `target`, lock
 them, and recursively compress the contents of every file within using the
 [LZFSE] algorithm. Files that are already compressed are skipped.
 
+You can also target other high-value dependency/build caches:
+
+```bash
+# Preview node_modules without modifying files
+cargo apfs-compress --cache node-modules --dry-run
+
+# Compress Go caches (GOCACHE + GOMODCACHE)
+cargo apfs-compress --cache go
+
+# Mix cache sources and custom directories
+cargo apfs-compress \
+  --cache cargo \
+  --cache node-modules \
+  --cache-dir ~/.pnpm-store \
+  --cache-dir ~/.npm
+```
+
+### Preview mode
+
+Use `--dry-run` (or `--preview`) to inspect what would be processed before
+compression:
+
+```bash
+cargo apfs-compress --dry-run
+```
+
+Dry-run mode discovers and reports directories, file counts, and total logical
+bytes, but does not compress files.
+
 > [!NOTE]
 > Newly created or updated files are not automatically compressed by APFS, so
 > you may need to re-run compression periodically after new builds.
 
 [LZFSE]: https://en.wikipedia.org/wiki/LZFSE
+
+## How the script works
+
+At a high level, `cargo apfs-compress` does this:
+
+1. Resolves which directories to process.
+   - By default, this is Cargo build output under `target/`.
+   - `--cache` and `--cache-dir` can add other caches (`node_modules`, Go
+     caches, custom directories).
+2. De-duplicates and sorts all resolved directories.
+3. Processes directories in parallel.
+4. For Cargo build directories, acquires the Cargo lock (`.cargo-lock`) before
+   compression and excludes that lock file from compression inputs.
+5. Recursively compresses discovered files with the selected compression kind.
+6. Reports per-directory success/failure and returns non-zero if any directory
+   fails.
+
+If `--dry-run` / `--preview` is enabled, it performs discovery and reporting
+only (no file compression writes).
 
 ## What? Why?
 
