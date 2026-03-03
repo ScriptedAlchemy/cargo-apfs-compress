@@ -64,6 +64,19 @@ compression:
 cargo apfs-compress --dry-run
 ```
 
+Running without a Cargo workspace
+
+`cargo apfs-compress` is a Cargo subcommand, but you can still run it against
+non-Rust caches or custom directories without a Cargo.toml:
+
+```bash
+# Preview a custom directory without a Cargo.toml
+cargo apfs-compress --dry-run --cache-dir /path/to/cache
+
+# Preview node_modules from any directory
+cargo apfs-compress --dry-run --cache node-modules
+```
+
 Dry-run mode discovers and reports directories, file counts, and total logical
 bytes, but does not compress files.
 

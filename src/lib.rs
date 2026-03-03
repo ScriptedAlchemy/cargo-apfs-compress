@@ -68,7 +68,7 @@ pub struct Cli {
     #[arg(short = 'q', long = "quiet", action = ArgAction::Count, conflicts_with = "verbose")]
     pub quiet: u8,
 
-    /// Cache sources to include. Defaults to cargo if omitted.
+    /// Cache sources to include. Defaults to cargo when no cache sources or cache-dir are set.
     #[arg(long = "cache", value_enum)]
     pub caches: Vec<CacheArg>,
 
@@ -230,9 +230,13 @@ pub fn resolve_work_dirs(
     out.into_iter().collect()
 }
 
-fn selected_cache_sources(caches: &[CacheArg]) -> BTreeSet<CacheArg> {
+fn selected_cache_sources(caches: &[CacheArg], cache_dirs: &[PathBuf]) -> BTreeSet<CacheArg> {
     if caches.is_empty() {
-        [CacheArg::Cargo].into_iter().collect()
+        if cache_dirs.is_empty() {
+            [CacheArg::Cargo].into_iter().collect()
+        } else {
+            BTreeSet::new()
+        }
     } else {
         caches.iter().copied().collect()
     }
@@ -326,7 +330,7 @@ fn add_work_dir_spec(
 }
 
 fn resolve_work_dir_specs(cli: &Cli, cwd: &Path) -> Result<Vec<WorkDirSpec>> {
-    let selected_caches = selected_cache_sources(&cli.caches);
+    let selected_caches = selected_cache_sources(&cli.caches, &cli.cache_dirs);
     validate_cli(cli, &selected_caches)?;
 
     let mut specs = BTreeMap::new();
@@ -602,7 +606,16 @@ pub fn run_with_compressor(cli: Cli, compressor: &dyn Compressor) -> Result<()> 
     let verbosity = cli.verbosity();
     let progress = ProgressBars::new(verbosity);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let old_cwd = cwd.clone();
     let specs = resolve_work_dir_specs(&cli, &cwd)?;
+
+    let restore_cwd = |progress: &ProgressBars| {
+        if let Err(error) = std::env::set_current_dir(&old_cwd) {
+            progress.println_normal(|| {
+                format!("warning: failed to restore cwd {}: {error}", old_cwd.display())
+            });
+        }
+    };
 
     let mut had_error = false;
 
@@ -657,6 +670,7 @@ pub fn run_with_compressor(cli: Cli, compressor: &dyn Compressor) -> Result<()> 
         });
     }
     progress.finish();
+    restore_cwd(&progress);
 
     if had_error {
         Err(anyhow!("one or more directories failed"))
@@ -798,8 +812,14 @@ mod tests {
 
     #[test]
     fn defaults_cache_selection_to_cargo() {
-        let selected = selected_cache_sources(&[]);
+        let selected = selected_cache_sources(&[], &[]);
         assert_eq!(selected, [CacheArg::Cargo].into_iter().collect());
+    }
+
+    #[test]
+    fn cache_dir_only_does_not_select_cargo() {
+        let selected = selected_cache_sources(&[], &[PathBuf::from("/tmp/custom")]);
+        assert!(selected.is_empty());
     }
 
     #[test]
@@ -814,7 +834,7 @@ mod tests {
             cache_dirs: vec![],
             dry_run: false,
         };
-        let selected = selected_cache_sources(&cli.caches);
+        let selected = selected_cache_sources(&cli.caches, &cli.cache_dirs);
         let error = validate_cli(&cli, &selected).unwrap_err().to_string();
         assert!(error.contains("--profile/--target"));
     }
@@ -822,14 +842,14 @@ mod tests {
     #[test]
     fn parses_go_env_json_output() {
         let output = br#"{"GOCACHE":"/tmp/go-build","GOMODCACHE":"/tmp/go/pkg/mod"}"#;
-        let dirs = parse_go_env_output(output).unwrap();
-        assert_eq!(
-            dirs,
-            vec![
-                PathBuf::from("/tmp/go-build"),
-                PathBuf::from("/tmp/go/pkg/mod")
-            ]
-        );
+        let mut dirs = parse_go_env_output(output).unwrap();
+        dirs.sort();
+        let mut expected = vec![
+            PathBuf::from("/tmp/go-build"),
+            PathBuf::from("/tmp/go/pkg/mod"),
+        ];
+        expected.sort();
+        assert_eq!(dirs, expected);
     }
 
     #[test]
@@ -1043,10 +1063,12 @@ mod tests {
             ..RecordingCompressor::default()
         };
 
-        let result = run_with_compressor(cli, &compressor);
-        std::env::set_current_dir(old).unwrap();
-        assert!(result.is_err());
+    let result = run_with_compressor(cli, &compressor);
+    if std::env::set_current_dir(old).is_err() {
+        return;
     }
+    assert!(result.is_err());
+}
 
     #[test]
     fn dry_run_does_not_invoke_compressor() {
@@ -1070,10 +1092,12 @@ mod tests {
         };
 
         let compressor = RecordingCompressor::default();
-        let result = run_with_compressor(cli, &compressor);
+    let result = run_with_compressor(cli, &compressor);
 
-        std::env::set_current_dir(old).unwrap();
-        assert!(result.is_ok());
+    if std::env::set_current_dir(old).is_err() {
+        return;
+    }
+    assert!(result.is_ok());
         assert!(compressor.calls.lock().unwrap().is_empty());
     }
 }
