@@ -641,6 +641,9 @@ pub fn run_with_compressor(cli: Cli, compressor: &dyn Compressor) -> Result<()> 
             }
         });
     } else {
+        progress.println_normal(|| {
+            "Apply mode: Total progress shows bytes queued for this run; already-compressed and skipped files are excluded.".to_owned()
+        });
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
             let progress_ref = &progress;
