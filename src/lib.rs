@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use applesauce::FileCompressor;
+use applesauce::{FileCompressor, Stats as ApplesauceStats};
 use applesauce::compressor::Kind;
 use applesauce::progress::Progress as _;
 use clap::{ArgAction, Parser, ValueEnum};
@@ -116,6 +116,102 @@ impl WorkDirSpec {
 struct DirSummary {
     files: u64,
     bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompressionSummary {
+    files_processed: u64,
+    logical_bytes: u64,
+    physical_bytes_before: u64,
+    physical_bytes_after: u64,
+    already_compressed_files: u64,
+    compressed_files_after: u64,
+    incompressible_files: u64,
+}
+
+impl CompressionSummary {
+    fn from_applesauce(stats: ApplesauceStats) -> Self {
+        use std::sync::atomic::Ordering;
+
+        Self {
+            files_processed: stats.files.load(Ordering::Relaxed),
+            logical_bytes: stats.total_file_sizes.load(Ordering::Relaxed),
+            physical_bytes_before: stats.compressed_size_start.load(Ordering::Relaxed),
+            physical_bytes_after: stats.compressed_size_final.load(Ordering::Relaxed),
+            already_compressed_files: stats.compressed_file_count_start.load(Ordering::Relaxed),
+            compressed_files_after: stats.compressed_file_count_final.load(Ordering::Relaxed),
+            incompressible_files: stats.incompressible_file_count.load(Ordering::Relaxed),
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.files_processed += other.files_processed;
+        self.logical_bytes += other.logical_bytes;
+        self.physical_bytes_before += other.physical_bytes_before;
+        self.physical_bytes_after += other.physical_bytes_after;
+        self.already_compressed_files += other.already_compressed_files;
+        self.compressed_files_after += other.compressed_files_after;
+        self.incompressible_files += other.incompressible_files;
+    }
+
+    fn newly_compressed_files(&self) -> u64 {
+        self.compressed_files_after
+            .saturating_sub(self.already_compressed_files)
+    }
+
+    fn saved_this_run_bytes(&self) -> u64 {
+        self.physical_bytes_before
+            .saturating_sub(self.physical_bytes_after)
+    }
+
+    fn round_savings_percent(&self) -> f64 {
+        if self.physical_bytes_before == 0 {
+            0.0
+        } else {
+            (self.saved_this_run_bytes() as f64 / self.physical_bytes_before as f64) * 100.0
+        }
+    }
+
+    fn total_savings_percent(&self) -> f64 {
+        if self.logical_bytes == 0 {
+            0.0
+        } else {
+            (self.logical_bytes.saturating_sub(self.physical_bytes_after) as f64
+                / self.logical_bytes as f64)
+                * 100.0
+        }
+    }
+}
+
+fn format_compression_summary(summary: CompressionSummary) -> Vec<String> {
+    vec![
+        format!("files processed: {}", summary.files_processed),
+        format!(
+            "already compressed: {}",
+            summary.already_compressed_files
+        ),
+        format!(
+            "files compressed this run: {}",
+            summary.newly_compressed_files()
+        ),
+        format!("incompressible/skipped: {}", summary.incompressible_files),
+        format!("logical bytes scanned: {}", HumanBytes(summary.logical_bytes)),
+        format!(
+            "physical before: {}",
+            HumanBytes(summary.physical_bytes_before)
+        ),
+        format!("physical after: {}", HumanBytes(summary.physical_bytes_after)),
+        format!(
+            "compression this round: {} ({:.2}%)",
+            HumanBytes(summary.saved_this_run_bytes()),
+            summary.round_savings_percent()
+        ),
+        format!(
+            "total compression after run: {} ({:.2}%)",
+            HumanBytes(summary.logical_bytes.saturating_sub(summary.physical_bytes_after)),
+            summary.total_savings_percent()
+        ),
+    ]
 }
 
 #[derive(Deserialize)]
@@ -457,7 +553,7 @@ pub trait Compressor: Send + Sync {
         paths: &[PathBuf],
         compression: Kind,
         progress: &ProgressBars,
-    ) -> Result<()>;
+    ) -> Result<CompressionSummary>;
 }
 
 #[derive(Default)]
@@ -469,11 +565,11 @@ impl Compressor for ApplesauceCompressor {
         paths: &[PathBuf],
         compression: Kind,
         progress: &ProgressBars,
-    ) -> Result<()> {
+    ) -> Result<CompressionSummary> {
         let mut compressor = FileCompressor::new();
         let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
-        compressor.recursive_compress(refs, compression, 1.0, 2, &progress, false);
-        Ok(())
+        let stats = compressor.recursive_compress(refs, compression, 1.0, 2, &progress, false);
+        Ok(CompressionSummary::from_applesauce(stats))
     }
 }
 
@@ -574,12 +670,13 @@ fn process_work_dir_spec(
     compression: Kind,
     progress: &ProgressBars,
     compressor: &dyn Compressor,
-) -> Result<()> {
-    with_work_dir_inputs(spec, progress, |inputs| {
+) -> Result<CompressionSummary> {
+    let summary = with_work_dir_inputs(spec, progress, |inputs| {
         compressor.compress_paths(inputs, compression, progress)
     })
-    .with_context(|| format!("compression failed for {}", spec.path.display()))?;
-    Ok(())
+    .with_context(|| format!("compression failed for {}", spec.path.display()))?
+    .unwrap_or_default();
+    Ok(summary)
 }
 
 pub fn process_work_dir(
@@ -587,7 +684,7 @@ pub fn process_work_dir(
     compression: Kind,
     progress: &ProgressBars,
     compressor: &dyn Compressor,
-) -> Result<()> {
+) -> Result<CompressionSummary> {
     let mut sources = BTreeSet::new();
     sources.insert("cargo".to_owned());
     let spec = WorkDirSpec {
@@ -618,6 +715,7 @@ pub fn run_with_compressor(cli: Cli, compressor: &dyn Compressor) -> Result<()> 
     };
 
     let mut had_error = false;
+    let spec_count = specs.len();
 
     if cli.dry_run {
         progress.println_normal(|| "Dry-run mode: previewing directories only".to_owned());
@@ -641,6 +739,7 @@ pub fn run_with_compressor(cli: Cli, compressor: &dyn Compressor) -> Result<()> 
             }
         });
     } else {
+        let mut overall_summary = CompressionSummary::default();
         progress.println_normal(|| {
             "Apply mode: Total progress shows bytes queued for this run; already-compressed and skipped files are excluded.".to_owned()
         });
@@ -650,20 +749,29 @@ pub fn run_with_compressor(cli: Cli, compressor: &dyn Compressor) -> Result<()> 
             for spec in specs {
                 handles.push(scope.spawn(move || {
                     let path = spec.path.clone();
+                    let source_summary = spec.source_summary();
                     let result = process_work_dir_spec(
                         &spec,
                         cli.compression.to_kind(),
                         progress_ref,
                         compressor,
                     );
-                    (path, result)
+                    (path, source_summary, result)
                 }));
             }
 
             for handle in handles {
-                let (path, result) = handle.join().expect("worker thread panicked");
+                let (path, source_summary, result) = handle.join().expect("worker thread panicked");
                 match result {
-                    Ok(()) => progress.println_normal(|| format!("Compressed {}", path.display())),
+                    Ok(summary) => {
+                        overall_summary.merge(summary);
+                        progress.println_normal(|| {
+                            format!("Compressed {} [{}]", path.display(), source_summary)
+                        });
+                        for line in format_compression_summary(summary) {
+                            progress.println_normal(|| format!("  {line}"));
+                        }
+                    }
                     Err(error) => {
                         had_error = true;
                         progress.error(&path, &format!("{error:#}"));
@@ -671,6 +779,12 @@ pub fn run_with_compressor(cli: Cli, compressor: &dyn Compressor) -> Result<()> 
                 }
             }
         });
+        if spec_count > 1 {
+            progress.println_normal(|| "Overall compression summary:".to_owned());
+            for line in format_compression_summary(overall_summary) {
+                progress.println_normal(|| format!("  {line}"));
+            }
+        }
     }
     progress.finish();
     restore_cwd(&progress);
@@ -930,7 +1044,7 @@ mod tests {
             paths: &[PathBuf],
             _compression: Kind,
             _progress: &ProgressBars,
-        ) -> Result<()> {
+        ) -> Result<CompressionSummary> {
             self.starts.lock().unwrap().push(Instant::now());
             self.calls.lock().unwrap().push(paths.to_vec());
             if self.delay > Duration::ZERO {
@@ -946,7 +1060,7 @@ mod tests {
                     return Err(anyhow!("intentional failure"));
                 }
             }
-            Ok(())
+            Ok(CompressionSummary::default())
         }
     }
 

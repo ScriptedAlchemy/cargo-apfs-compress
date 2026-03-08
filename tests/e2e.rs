@@ -32,6 +32,11 @@ fn command_succeeds_and_prints_compressed() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Apply mode: Total progress shows bytes queued for this run"));
     assert!(stdout.contains("Compressed"));
+    assert!(stdout.contains("files processed:"));
+    assert!(stdout.contains("already compressed:"));
+    assert!(stdout.contains("files compressed this run:"));
+    assert!(stdout.contains("compression this round:"));
+    assert!(stdout.contains("total compression after run:"));
     assert!(!stdout.contains("exclude .cargo-lock"));
 }
 
